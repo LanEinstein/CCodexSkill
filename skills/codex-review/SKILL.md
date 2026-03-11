@@ -55,9 +55,11 @@ Cross-model collaborative code review: Claude Code writes/fixes code, Codex CLI 
 
 #### First Cycle (CYCLE == 1): Use `codex review --uncommitted`
 
-Build the review prompt by combining the base prompt template with language-specific additions.
+**Important**: `codex review --uncommitted` uses Codex's built-in review analysis. It does NOT accept a custom prompt alongside `--uncommitted`. The output goes to stderr and uses Codex's own format (`[P1]`/`[P2]` priority levels).
 
-**Base Review Prompt:**
+Claude Code should parse Codex's native output format (see Phase 3) rather than expecting the structured format below. The structured format below is the **reference checklist** for Claude Code to use when evaluating Codex's findings.
+
+**Reference Review Dimensions** (for Claude Code's evaluation in Phase 3-4):
 
 ```
 You are reviewing uncommitted code changes. Analyze systematically across these dimensions:
@@ -134,11 +136,13 @@ With 1-2 sentence justification.
 
 **Execute the review:**
 ```bash
-bash scripts/run-codex-review.sh review \
+bash /home/ps/.claude/scripts/run-codex-review.sh review \
     --project-dir "$(pwd)" \
     --output "$REVIEW_DIR/cycle_${CYCLE}.md" \
-    --prompt "$REVIEW_PROMPT"
+    --prompt "ignored-in-review-mode"
 ```
+
+**Note**: In review mode, `--prompt` is ignored. Codex uses its own built-in review analysis. The output file will contain Codex's full stderr output including diagnostic messages — Claude Code should extract the review findings (lines starting with `- [P1]`, `- [P2]`, etc.) and the summary paragraph (line starting with `codex`).
 
 #### Subsequent Cycles (CYCLE > 1): Use `codex exec` with incremental prompt
 
@@ -192,15 +196,23 @@ bash scripts/run-codex-review.sh exec \
 ### Phase 3: EVALUATE — Parse Codex Output
 
 1. Read the output file: `$REVIEW_DIR/cycle_${CYCLE}.md`
-2. Extract:
-   - **Verdict**: PASS / NEEDS_FIXES / MAJOR_CONCERNS
-   - **Issue list**: Each issue with severity, file, confidence, description, fix suggestion
-   - **Summary counts**: CRITICAL, WARNING, INFO
-3. If output is empty or unparseable:
+2. **Parse Codex's native format**:
+   - **For cycle 1** (`codex review` output): Look for lines matching `- [P1]` or `- [P2]` etc. Each issue block contains:
+     - Priority line: `- [P1] Title — file:line-line`
+     - Description: indented paragraph following the priority line
+     - Summary paragraph: line starting with word `codex` near the end
+   - **For cycle 2+** (`codex exec` output): Parse the structured format requested in the incremental prompt
+   - Map Codex priorities to severity: `P1` → CRITICAL, `P2` → WARNING, `P3+` → INFO
+3. **Determine verdict**:
+   - If any P1 issues found → NEEDS_FIXES or MAJOR_CONCERNS
+   - If only P2/P3 issues → NEEDS_FIXES
+   - If no issues found → PASS
+   - If Codex summary says "safe to ship" or similar → PASS
+4. If output is empty or unparseable:
    - Log warning: "Codex output could not be parsed for cycle N"
    - Treat as **UNKNOWN** — do NOT treat as PASS. Include prominently in the final report: "第 N 轮审查输出不可用，代码未经实际审查"
    - Continue to next cycle if cycles remain; otherwise report with caveat
-4. Store parsed issues in `ISSUES_LIST` for use in Phase 4 and subsequent cycles.
+5. Store parsed issues in `ISSUES_LIST` for use in Phase 4 and subsequent cycles.
 
 ### Phase 4: FIX — Claude Code Applies Fixes
 

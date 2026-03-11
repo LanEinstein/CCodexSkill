@@ -6,8 +6,8 @@
 #   bash run-codex-review.sh review --project-dir DIR --output FILE --prompt "..."
 #   bash run-codex-review.sh exec   --project-dir DIR --output FILE --prompt "..."
 #
-# review mode: codex review --uncommitted -o $OUTPUT "$PROMPT"
-# exec   mode: codex exec -C $DIR -o $OUTPUT --ephemeral --full-auto -s read-only "$PROMPT"
+# review mode: cd $DIR && codex review --uncommitted "$PROMPT" > $OUTPUT
+# exec   mode: cd $DIR && codex exec --ephemeral -s read-only -o $OUTPUT "$PROMPT"
 #
 # Timeout: 300 seconds (override with --timeout N)
 # Exit codes: 0=success, 1=failure, 124=timeout
@@ -89,21 +89,20 @@ EXIT_CODE=0
 
 case "$MODE" in
     review)
+        # codex review outputs everything to stderr; stdout is empty
+        # --uncommitted cannot be combined with [PROMPT], so prompt is ignored in review mode
         echo "Running: codex review --uncommitted ..." >&2
-        (cd "$PROJECT_DIR" && timeout "$TIMEOUT" "$CODEX_BIN" review --uncommitted \
-            -o "$OUTPUT_FILE" \
-            "$PROMPT") \
-            2>&1 || EXIT_CODE=$?
+        (cd "$PROJECT_DIR" && timeout "$TIMEOUT" "$CODEX_BIN" review --uncommitted) \
+            2>"$OUTPUT_FILE" || EXIT_CODE=$?
         ;;
     exec)
+        # codex exec supports -o for output file; cd into project dir first
         echo "Running: codex exec (read-only) ..." >&2
-        timeout "$TIMEOUT" "$CODEX_BIN" exec \
-            -C "$PROJECT_DIR" \
-            -o "$OUTPUT_FILE" \
+        (cd "$PROJECT_DIR" && timeout "$TIMEOUT" "$CODEX_BIN" exec \
             --ephemeral \
-            --full-auto \
             -s read-only \
-            "$PROMPT" \
+            -o "$OUTPUT_FILE" \
+            "$PROMPT") \
             2>&1 || EXIT_CODE=$?
         ;;
     *)
