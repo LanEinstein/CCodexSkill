@@ -136,7 +136,7 @@ With 1-2 sentence justification.
 
 **Execute the review:**
 ```bash
-bash /home/ps/.claude/scripts/run-codex-review.sh review \
+bash scripts/run-codex-review.sh review \
     --project-dir "$(pwd)" \
     --output "$REVIEW_DIR/cycle_${CYCLE}.md" \
     --prompt "ignored-in-review-mode"
