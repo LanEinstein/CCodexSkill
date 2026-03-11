@@ -9,7 +9,7 @@
 # review mode: cd $DIR && codex review --uncommitted "$PROMPT" > $OUTPUT
 # exec   mode: cd $DIR && codex exec --ephemeral -s read-only -o $OUTPUT "$PROMPT"
 #
-# Timeout: 300 seconds (override with --timeout N)
+# Timeout: 1000 seconds (override with --timeout N)
 # Exit codes: 0=success, 1=failure, 124=timeout
 
 set -euo pipefail
@@ -19,7 +19,7 @@ MODE=""
 PROJECT_DIR="."
 OUTPUT_FILE=""
 PROMPT=""
-TIMEOUT=300
+TIMEOUT=1000
 
 # --- Parse arguments ---
 if [[ $# -lt 1 ]]; then
