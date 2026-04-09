@@ -49,6 +49,8 @@ Cross-model collaborative code review: Claude Code writes/fixes code, Codex CLI 
    - `CYCLE=1`
    - `MAX_CYCLES` = user parameter or default 3
    - `ISSUES_LIST=[]`
+   - `FIXES_APPLIED_TOTAL=0`  ← incremented in Phase 4 each time a real fix is applied
+   - `FIX_HISTORY=[]`         ← preserves per-cycle FIX_SUMMARY for Phase 6 verification prompt
    - `REVIEW_DIR=$(mktemp -d /tmp/codex_review_XXXXXX)`
 
 ### Phase 2: REVIEW — Call Codex
@@ -195,24 +197,36 @@ bash scripts/run-codex-review.sh exec \
 
 ### Phase 3: EVALUATE — Parse Codex Output
 
-1. Read the output file: `$REVIEW_DIR/cycle_${CYCLE}.md`
-2. **Parse Codex's native format**:
+1. **Check the wrapper's exit code first.** If `run-codex-review.sh` returned non-zero (Codex CLI failure, upstream stream disconnect, timeout, etc.), do **NOT** parse the output for issues. Skip directly to step 5 with `verdict = UNKNOWN`.
+
+2. Read the output file: `$REVIEW_DIR/cycle_${CYCLE}.md`
+
+3. **Detect Codex API failure markers.** Even when the wrapper exit was zero, the output file may contain failure markers from a partial response. If the file contains **any** of:
+   - `ERROR: stream disconnected`
+   - `ERROR: Reconnecting...`
+   - `Review was interrupted`
+   - `Codex timed out`
+   - `Error: Codex exited with code`
+   - is empty or under 100 bytes
+   
+   then set `verdict = UNKNOWN` and skip to step 5. **Critical**: an output that contains failure markers but no `- [P1]/[P2]` lines is NOT the same as "no issues found = PASS" — Codex never actually completed the review.
+
+4. **Parse Codex's native format** (only reached when steps 1+3 passed):
    - **For cycle 1** (`codex review` output): Look for lines matching `- [P1]` or `- [P2]` etc. Each issue block contains:
      - Priority line: `- [P1] Title — file:line-line`
      - Description: indented paragraph following the priority line
      - Summary paragraph: line starting with word `codex` near the end
    - **For cycle 2+** (`codex exec` output): Parse the structured format requested in the incremental prompt
    - Map Codex priorities to severity: `P1` → CRITICAL, `P2` → WARNING, `P3+` → INFO
-3. **Determine verdict**:
-   - If any P1 issues found → NEEDS_FIXES or MAJOR_CONCERNS
-   - If only P2/P3 issues → NEEDS_FIXES
-   - If no issues found → PASS
-   - If Codex summary says "safe to ship" or similar → PASS
-4. If output is empty or unparseable:
-   - Log warning: "Codex output could not be parsed for cycle N"
-   - Treat as **UNKNOWN** — do NOT treat as PASS. Include prominently in the final report: "第 N 轮审查输出不可用，代码未经实际审查"
-   - Continue to next cycle if cycles remain; otherwise report with caveat
-5. Store parsed issues in `ISSUES_LIST` for use in Phase 4 and subsequent cycles.
+   - **Determine verdict**:
+     - If any P1 issues found → NEEDS_FIXES or MAJOR_CONCERNS
+     - If only P2/P3 issues → NEEDS_FIXES
+     - If no issues found AND a substantive summary is present (e.g. line starting with `codex` followed by reviewer text) → PASS
+     - If Codex summary says "safe to ship" or similar → PASS
+
+5. **Store result**:
+   - Store parsed issues in `ISSUES_LIST` for use in Phase 4 and subsequent cycles.
+   - If `verdict == UNKNOWN`: Log warning `"Codex output could not be parsed for cycle N"`. Surface prominently in the final report: `"第 N 轮审查输出不可用,代码未经实际审查"`. Do **NOT** apply any fixes in Phase 4 for an UNKNOWN cycle (there are no validated issues to act on).
 
 ### Phase 4: FIX — Claude Code Applies Fixes
 
@@ -220,7 +234,7 @@ bash scripts/run-codex-review.sh exec \
 
 1. For each issue (CRITICAL first, then WARNING):
    - **Assess validity**: Is this a genuine issue or a false positive?
-   - If **genuine**: Apply the fix using Edit/Write tools. Record what was done.
+   - If **genuine**: Apply the fix using Edit/Write tools. Record what was done. Increment `FIXES_APPLIED_TOTAL`.
    - If **false positive**: Mark as `DISMISSED` with a clear reason. Do NOT skip silently — document the rationale.
 2. Stage fixed files: `git add <fixed_files>`
 3. Build `FIX_SUMMARY` for the incremental prompt:
@@ -229,16 +243,33 @@ bash scripts/run-codex-review.sh exec \
    Issue #2 [WARNING] Missing null check in utils.ts:15 → FIXED: Added guard clause
    Issue #3 [INFO] Unused import in main.go:3 → DISMISSED: Import used in build tag
    ```
+4. Append the current cycle's `FIX_SUMMARY` (tagged with cycle number) to `FIX_HISTORY` so Phase 6 can replay the full fix trail to Codex during verification.
 
 ### Phase 5: LOOP — Decide Next Action
 
+Track the exit reason in a variable `EXIT_REASON` so Phase 6 can decide whether to run final verification.
+
 ```
-IF verdict == "PASS":
+IF verdict == "UNKNOWN":
+    # Codex itself failed (upstream error, timeout, etc.). No fixes possible.
+    # Try one more cycle in case the failure was transient.
+    IF this is the FIRST consecutive UNKNOWN AND CYCLE < MAX_CYCLES:
+        CYCLE += 1
+        → Go to Phase 2 (retry with same mode)
+    ELSE:
+        # Two consecutive UNKNOWNs OR already at max cycles → bail out cleanly.
+        EXIT_REASON = "codex_unavailable"
+        → Go to Phase 7 (skip Phase 6 — there is nothing to verify)
+
+ELIF verdict == "PASS":
+    EXIT_REASON = "passed"
     → Go to Phase 6
 ELIF CYCLE >= MAX_CYCLES:
-    → Go to Phase 6 (with note: max cycles reached)
+    EXIT_REASON = "max_cycles_reached"
+    → Go to Phase 6
 ELIF no fixes were applied (all dismissed):
-    → Go to Phase 6 (with note: all issues dismissed as false positives)
+    EXIT_REASON = "all_dismissed"
+    → Go to Phase 6
 ELSE:
     CYCLE += 1              ← increment FIRST
     → Go to Phase 2         ← then use new CYCLE value for output filename
@@ -246,7 +277,90 @@ ELSE:
 
 **Important**: Always increment `CYCLE` before constructing the output path `cycle_${CYCLE}.md` to avoid overwriting previous cycle output.
 
-### Phase 6: REPORT — Generate Chinese Review Report
+### Phase 6: FINAL VERIFICATION — Read-only Closure Check
+
+**Purpose**: When the loop exits because `MAX_CYCLES` was reached and Claude Code applied at least one fix in the last (or any) cycle, those final fixes have **never been re-checked by Codex**. This phase runs one extra read-only Codex pass to give the user real closure on whether the last round of changes actually resolved the issues — without consuming a fix cycle and without applying any new edits.
+
+**Trigger decision**:
+
+```
+IF EXIT_REASON == "codex_unavailable":
+    VERIFICATION_STATUS = "SKIPPED"
+    SKIP_REASON = "codex_unavailable"
+    → Go to Phase 7 (Phase 7 must surface this prominently)
+ELIF EXIT_REASON == "passed":
+    VERIFICATION_STATUS = "SKIPPED"
+    SKIP_REASON = "first_or_intermediate_cycle_passed"
+    → Go to Phase 7
+ELIF EXIT_REASON == "all_dismissed" OR FIXES_APPLIED_TOTAL == 0:
+    VERIFICATION_STATUS = "SKIPPED"
+    SKIP_REASON = "no_fixes_applied"
+    → Go to Phase 7
+ELSE:  # EXIT_REASON == "max_cycles_reached" AND FIXES_APPLIED_TOTAL > 0
+    VERIFICATION_STATUS = "EXECUTED"
+    → Run verification below, then Phase 7
+```
+
+**Verification prompt** (built from `FIX_HISTORY`):
+
+```
+This is a FINAL VERIFICATION pass after {TOTAL_CYCLES} review-fix cycles.
+Do NOT propose new improvements or refactors. This is a closure check, not another review.
+
+## Previously reported issues across all cycles (with attempted fixes):
+{FIX_HISTORY_FLATTENED}
+
+## Your tasks:
+1. For each previously reported issue, classify the CURRENT state of the code:
+   - RESOLVED   : The fix correctly addresses it
+   - UNRESOLVED : Issue still present or fix is incomplete
+   - REGRESSED  : Fix introduced a new defect
+
+2. Scan ONLY for NEW CRITICAL (P1) regressions introduced by the fixes themselves.
+   IGNORE all P2/P3, style, and maintainability findings — they are out of scope here.
+
+## Output Format
+### Verification Table
+| # | Original Issue | Status | Notes |
+|---|----------------|--------|-------|
+
+### New Critical Regressions (if any)
+[SEVERITY] file:line — description
+(Output the literal word "NONE" if no regressions found.)
+
+### Final Verdict
+PASS    — all previously reported issues RESOLVED, no regressions
+PARTIAL — some issues UNRESOLVED but no critical regressions
+FAILED  — at least one REGRESSED entry, or a P1-severity issue is still UNRESOLVED
+```
+
+**Execute**:
+
+```bash
+bash scripts/run-codex-review.sh exec \
+    --project-dir "$(pwd)" \
+    --output "$REVIEW_DIR/final_verification.md" \
+    --prompt "$VERIFICATION_PROMPT"
+```
+
+**Parse the output** using the same logic as Phase 3, then build:
+
+```
+VERIFICATION_RESULT = {
+    verdict:      PASS | PARTIAL | FAILED | UNKNOWN,
+    table_rows:   [{ idx, issue, status, notes }, ...],
+    regressions:  [{ severity, file, line, description }, ...],
+    raw_output:   <verbatim contents of final_verification.md>
+}
+```
+
+**Hard rules for this phase**:
+- **Read-only**: Do NOT call Edit, Write, or `git add` here. Even if Codex flags a real remaining issue, do not fix it — it must surface in the report so the user can decide.
+- **Does not increment `CYCLE`**: This is not a fix cycle.
+- **Does not change `FIXES_APPLIED_TOTAL`**: No fixes happen here.
+- **Unparseable / empty output**: Set `VERIFICATION_RESULT.verdict = UNKNOWN` and surface the raw output in the report. Do NOT silently treat unknown as PASS.
+
+### Phase 7: REPORT — Generate Chinese Review Report
 
 Generate a comprehensive Chinese report and display it to the user.
 
@@ -258,7 +372,16 @@ Generate a comprehensive Chinese report and display it to the user.
 **项目**: {project_name}
 **审查时间**: {timestamp}
 **审查轮次**: {total_cycles} / {max_cycles}
-**最终判定**: {final_verdict}
+**最终判定**: {final_verdict_with_verification_suffix}
+
+> `{final_verdict_with_verification_suffix}` 取值规则:
+> - Phase 5 因 `passed` 退出 → `✅ 通过`
+> - Phase 6 复核 verdict = PASS → `✅ 通过 (经最终复核)`
+> - Phase 6 复核 verdict = PARTIAL → `⚠️ 部分通过 — 达到最大轮次后仍有 {n} 个问题未解决`
+> - Phase 6 复核 verdict = FAILED → `❌ 未通过 — 复核发现严重回归 / 关键问题未解决`
+> - Phase 6 复核 verdict = UNKNOWN → `❓ 复核结果不可用 — 详见最终验证章节`
+> - Phase 5 因 `all_dismissed` 退出 → `ℹ️ 未变更 — 全部判定为误报`
+> - Phase 5 因 `codex_unavailable` 退出 → `🚫 审查未完成 — Codex CLI 不可用 (上游错误 / 超时),代码未经实际审查`
 
 ---
 
@@ -298,6 +421,28 @@ Generate a comprehensive Chinese report and display it to the user.
 | # | 问题 | 排除理由 |
 |---|------|----------|
 {dismissed_rows}
+
+## 最终验证 (Final Verification)
+
+> 当审查在达到最大轮次时退出，会对最后一轮的修复结果执行一次独立的只读复核。
+
+**复核状态**: {verification_status}    ← EXECUTED 或 SKIPPED
+**复核判定**: {verification_verdict}    ← 仅当 EXECUTED：PASS / PARTIAL / FAILED / UNKNOWN
+**跳过原因**: {skip_reason}              ← 仅当 SKIPPED：first_or_intermediate_cycle_passed / no_fixes_applied
+
+### 历史问题复核结果
+
+| # | 原问题 | 当前状态 | 备注 |
+|---|--------|----------|------|
+{verification_table_rows}
+
+### 复核中发现的新增严重问题
+
+| # | 严重度 | 文件 | 描述 |
+|---|--------|------|------|
+{regression_rows}
+
+> 若 Codex 在复核中未报告新增严重问题，本表显示"无"。
 
 ## 未解决问题
 

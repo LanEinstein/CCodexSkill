@@ -96,13 +96,17 @@ case "$MODE" in
             2>"$OUTPUT_FILE" || EXIT_CODE=$?
         ;;
     exec)
-        # codex exec supports -o for output file; cd into project dir first
+        # codex exec supports -o for output file; cd into project dir first.
+        # Redirect stdin from /dev/null: codex 0.118.0+ reads stdin as an appended
+        # `<stdin>` block whenever stdin is not a TTY. In non-interactive contexts
+        # (CI, Claude Code subprocess, background jobs) stdin is a pipe that never
+        # closes, which causes codex to hang until the outer timeout fires.
         echo "Running: codex exec (read-only) ..." >&2
         (cd "$PROJECT_DIR" && timeout "$TIMEOUT" "$CODEX_BIN" exec \
             --ephemeral \
             -s read-only \
             -o "$OUTPUT_FILE" \
-            "$PROMPT") \
+            "$PROMPT" < /dev/null) \
             2>&1 || EXIT_CODE=$?
         ;;
     *)

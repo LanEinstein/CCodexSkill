@@ -31,14 +31,15 @@ command -v codex
 
 ### 3. Execute Review Flow
 
-Follow the **codex-review** skill (SKILL.md) phases 1 through 6:
+Follow the **codex-review** skill (SKILL.md) phases 1 through 7:
 
 - **Phase 1 (PREPARE)**: Collect change stats, detect language, initialize state
 - **Phase 2 (REVIEW)**: Call Codex via `scripts/run-codex-review.sh`
 - **Phase 3 (EVALUATE)**: Parse Codex output, extract issues and verdict
 - **Phase 4 (FIX)**: Fix genuine issues, dismiss false positives with reasoning
 - **Phase 5 (LOOP)**: Continue if needed (cycle < max-cycles and fixes applied)
-- **Phase 6 (REPORT)**: Generate and display Chinese review report
+- **Phase 6 (FINAL VERIFICATION)**: When max-cycles is reached with fixes applied, run one read-only Codex pass to verify the last round's fixes — no new edits
+- **Phase 7 (REPORT)**: Generate and display Chinese review report (includes the final verification result)
 
 ### 4. Output
 
